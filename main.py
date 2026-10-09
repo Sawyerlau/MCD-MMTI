@@ -657,38 +657,75 @@ def persona_timeline(ctx: MMTIContext) -> list[tuple[str, str]]:
 
 
 def _w(s: str) -> int:
-    """计算字符串的终端显示宽度（CJK 字符占 2 列）。"""
+    """计算字符串的终端显示宽度（东亚全角/宽字符占 2 列）。"""
     return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
 
 
-def _row(s: str = "", width: int = 33) -> str:
-    """生成一行对齐的卡片边框内容。"""
-    return f"| {s.ljust(width)} |"
+def _pad(s: str, width: int) -> str:
+    """按显示宽度右补空格。
+
+    不能用 str.ljust —— 它按字符个数补齐，而中文占 2 列，
+    会导致边框在混排时歪掉（实测踩坑）。
+    """
+    return s + " " * max(0, width - _w(s))
+
+
+def _center(s: str, width: int) -> str:
+    """按显示宽度居中。"""
+    gap = max(0, width - _w(s))
+    left = gap // 2
+    return " " * left + s + " " * (gap - left)
+
+
+def _trunc(s: str, width: int) -> str:
+    """按显示宽度截断，超出部分以省略号标记。"""
+    if _w(s) <= width:
+        return s
+    out = ""
+    for ch in s:
+        if _w(out + ch) > width - 1:
+            return out + "…"
+        out += ch
+    return out
+
+
+# 卡片内容区宽度（不含左右边框）
+CARD_W = 40
+# 左侧内边距
+PAD = 2
+
+
+def _row(s: str = "", width: int = CARD_W, pad: int = PAD) -> str:
+    """生成一行卡片内容：| + 内边距 + 内容 + 补齐 |"""
+    return "|" + " " * pad + _pad(s, width - pad) + "|"
 
 
 def render_card(v: PersonaVerdict) -> str:
     """三段式人格卡：是谁 / 多准 / 是什么。
 
-    使用东���宽度对齐，保证中英文混排时边框不歪。
+    所有对齐均按东亚显示宽度计算，保证中英文混排时边框对齐。
     """
     p = v.persona
-    w = 33
-    bar = "+" + "-" * (w + 2) + "+"
+    w = CARD_W
+    bar = "╭" + "─" * (w + 1) + "╮"
+    foot = "╰" + "─" * (w + 1) + "╯"
+    sep = "├" + "─" * (w + 1) + "┤"
+
     lines = [
         bar,
         _row("MMTI · 系统判定，可推翻", w),
-        _row("", w),
-        _row(p.name.center(w + (_w(p.name) - 0) // 2 - _w(p.name) % 2), w),
-        _row(v.family_tagline.center(w + (len(v.family_tagline) - _w(v.family_tagline))), w),
-        _row("", w),
+        sep,
+        _row(_center(p.name, w - PAD), w),
+        _row(_center(v.family_tagline, w - PAD), w),
+        sep,
     ]
-    for f in v.facts[:4]:
-        lines.append(_row(f[:w], w))
+    for f in v.facts[:5]:
+        lines.append(_row(_trunc(f, w - PAD), w))
     lines += [
-        _row("", w),
-        _row(p.tagline[:w], w),
+        sep,
+        _row(_trunc(p.tagline, w - PAD), w),
         _row("可切换或自选 16 张人格", w),
-        bar,
+        foot,
     ]
     return "\n".join(lines)
 
