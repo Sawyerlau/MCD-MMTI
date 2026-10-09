@@ -129,7 +129,41 @@ python main.py --now 2026-10-09T21:05 --timeline
 
 # 列出全部 16 型人格
 python main.py --list
+
+# 自测：验证 16 张人格是否均可被判定触达
+python main.py --coverage
 ```
+
+`--coverage` 会构造 16 组样本数据逐一验证判定规则，当前状态 **16/16 全部通过**：
+
+```text
+====================================================
+MMTI 人格判定覆盖率自测
+====================================================
+人格 key      预期          实际          结果
+----------------------------------------------------
+perfect     perfect     perfect     PASS
+coupon      coupon      coupon      PASS
+midnight    midnight    midnight    PASS
+points      points      points      PASS
+random      random      random      PASS
+king        king        king        PASS
+biggest     biggestbiggest     PASS
+double      double      double      PASS
+starving    starving    starving    PASS
+plank       plank       plank       PASS
+oat         oat         oat         PASS
+zero        zero        zero        PASS
+protein     protein     protein     PASS
+kid         kid         kid         PASS
+pie         pie         pie         PASS
+slacker     slacker     slacker     PASS
+----------------------------------------------------
+覆盖率：16/16
+```
+
+> 自测中的合成订单仅用于验证判定规则可触达，不含真实用户数据。
+> `--now` / `--timeline` 使用的则是采样自 MCP 实测返回的真实数据。
 
 Demo 输出示例：
 

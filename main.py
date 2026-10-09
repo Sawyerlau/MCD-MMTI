@@ -136,8 +136,21 @@ class Coupon:
 
 
 @dataclass
+class OrderItem:
+    """对应 order-list 中 orderProductList[].comboItemList[] 的子项。"""
+
+    name: str
+    code: str
+    quantity: int = 1
+
+
+@dataclass
 class Order:
-    """对应 order-list 返回条目。"""
+    """对应 order-list 返回条目。
+
+    combo_items 与 nutrition 由 MMTI 在本地关联匹配（MCP 分两个接口返回），
+    分别来自 order-list 的 comboItemList 与 list-nutrition-foods。
+    """
 
     order_id: str
     created_at: datetime
@@ -145,6 +158,24 @@ class Order:
     product_code: str
     amount_cny: float
     store_name: str
+    combo_items: list[OrderItem] = field(default_factory=list)
+    nutrition: Optional["NutritionItem"] = None
+
+    @property
+    def all_item_names(self) -> list[str]:
+        """本单所有餐品名称，含套餐子项。"""
+        names = [self.product_name]
+        names += [i.name for i in self.combo_items]
+        return names
+
+    @property
+    def hour(self) -> int:
+        return self.created_at.hour
+
+    @property
+    def is_work_hour(self) -> bool:
+        """工作日 10:00-17:00 —— 摸鱼达人判定用的时间窗。"""
+        return self.created_at.weekday() < 5 and 10 <= self.hour < 17
 
 
 @dataclass
@@ -186,6 +217,7 @@ class MMTIContext:
     orders: list[Order] = field(default_factory=list)
     points: Optional[PointAccount] = None
     lottery: Optional[Lottery] = None
+    nutrition: list[NutritionItem] = field(default_factory=list)
 
 
 # ============================================================================
@@ -213,15 +245,216 @@ def _parse_weekdays(spec: str) -> tuple[int, ...]:
     return tuple(table[ch] for ch in spec if ch in table)
 
 
+# ============================================================================
+# 三、口味特征分析
+#
+# 历史订单（order-list）与营养库（list-nutrition-foods）分属两个 MCP 接口，
+# 这里在本地关联：订单餐品名 → 营养条目，得到可计算的行为特征。
+# ============================================================================
+
+# 品类关键词表。命中即归入该品类，用于计算占比。
+# 顺序即匹配优先级：特异性高的放前面。
+# 例如「儿童鱼排堡」必须先于「鱼排」命中，否则会被误判成鱼类。
+CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "kids": ("儿童", "开心乐园", "小 Mega", "小士"),
+    "roll": ("营养卷", "笋卷", "卷"),
+    "pie": ("派",),
+    "chicken": ("鸡腿堡", "鸡翅", "鸡块", "麦乐鸡", "脆汁鸡", "鸡排",
+                "炸鸡", "辣翅", "趣鸡球", "V翅"),
+    "fish": ("鱼排", "鳕鱼", "麦香鱼", "鱼堡"),
+    "burger": ("汉堡", "巨无霸", "吉士", "堡"),
+    "drink": ("可乐", "雪碧", "红茶", "奶茶", "奶铁", "美式", "拿铁", "卡布",
+              "豆浆", "牛奶", "果汁", "咖啡", "水"),
+    "dessert": ("旋", "新地", "筒", "布丁", "松饼"),
+}
+
+# 特征阈值（占比，超过即判定该品类人格）
+THRESHOLD_MAJORITY = 0.40  # 绝对多数
+THRESHOLD_SEGMENT = 0.25   # 显著份额
+
+# 摸鱼达人判定：工作日 10:00-17:00 下单占比
+THRESHOLD_WORK_HOUR = 0.30
+
+
+@dataclass
+class TasteProfile:
+    """从历史订单与营养库关联出的行为特征。"""
+
+    total_orders: int = 0
+    category_ratio: dict[str, float] = field(default_factory=dict)
+    avg_kcal: Optional[float] = None
+    avg_protein: Optional[float] = None
+    avg_sodium: Optional[float] = None
+    high_kcal_ratio: float = 0.0  # 单品 500 kcal 以上的订单占比
+    zero_drink_ratio: float = 0.0  # 点了0/极低卡饮品的订单占比
+    work_hour_ratio: float = 0.0  # 工作日 10-17 点下单占比
+    matched_orders: int = 0  # 成功关联营养数据的订单数
+
+
+def build_taste_profile(ctx: MMTIContext) -> TasteProfile:
+    """构建口味特征。所有比例均基于真实订单计算，不做推断。"""
+    prof = TasteProfile(total_orders=len(ctx.orders))
+    if not ctx.orders:
+        return prof
+
+    # 关联营养库
+    index = {n.name: n for n in ctx.nutrition}
+    matched: list[tuple[Order, NutritionItem]] = []
+    cat_hits: dict[str, int] = {k: 0 for k in CATEGORY_KEYWORDS}
+
+    for o in ctx.orders:
+        names = o.all_item_names
+        hit_nutrition = None
+        for nm in names:
+            if nm in index:
+                hit_nutrition = index[nm]
+                break
+        if hit_nutrition is not None:
+            matched.append((o, hit_nutrition))
+        for nm in names:
+            for cat, kws in CATEGORY_KEYWORDS.items():
+                if any(k in nm for k in kws):
+                    cat_hits[cat] += 1
+                    break
+
+    n = len(ctx.orders)
+    prof.category_ratio = {k: v / n for k, v in cat_hits.items()}
+    prof.matched_orders = len(matched)
+
+    if matched:
+        prof.avg_kcal = sum(m.kcal for _, m in matched) / len(matched)
+        prof.avg_protein = sum(m.protein for _, m in matched) / len(matched)
+        prof.avg_sodium = sum(m.sodium for _, m in matched) / len(matched)
+        prof.high_kcal_ratio = sum(1 for _, m in matched if m.kcal >= 500) / len(matched)
+        prof.zero_drink_ratio = sum(1 for _, m in matched if m.kcal <= 150) / len(matched)
+
+    prof.work_hour_ratio = sum(1 for o in ctx.orders if o.is_work_hour) / n
+    return prof
+
+
+def _judge_by_taste(ctx: MMTIContext, prof: TasteProfile,
+                    facts: list[str], confidence: str) -> Optional[PersonaVerdict]:
+    """基于口味特征判定食欲型 / 身体型 / 心情型人格。
+
+    返回 None 表示未命中，交由上层继续判定。
+    """
+    if prof.total_orders < 2:
+        return None
+
+    cr = prof.category_ratio
+    facts_with_taste = facts + [f"口味分布：{_top_category_cn(prof)}"]
+    kcal = prof.avg_kcal or 0
+    pro = prof.avg_protein or 0
+
+    # ======================================================================
+    # 判定顺序说明（依据实测数据标定，勿随意调换）：
+    #   1. 品类强特征（儿童餐/派）—— 一票通过
+    #   2. 饮品系（燕麦/零糖）    —— 场景明确，不易与其他型混淆
+    #   3. 热量分层（绝代双爽/卷王）—— 用绝对 kcal 分层
+    #   4. 蛋白与运动场景（平板支撑/摸鱼）—— 需热量条件配合
+    #   5. 品类兜底（干饭/急死）  —— 鸡肉/汉堡主导
+    #   6. 蛋白底线                —— 最后兜底，避免抢前面类型的判定
+    # ======================================================================
+
+    # ---- 1. 心情型：品类强特征 ----
+    if cr.get("kids", 0) >= THRESHOLD_MAJORITY:
+        return PersonaVerdict(
+            PERSONA_MAP["kid"],
+            f"你有 {cr['kids']:.0%} 的订单是儿童餐，六十岁也想吃儿童餐",
+            facts_with_taste, confidence)
+    if cr.get("pie", 0) >= THRESHOLD_SEGMENT:
+        return PersonaVerdict(
+            PERSONA_MAP["pie"],
+            f"你的订单里 {cr['pie']:.0%} 带派，有派才有气氛",
+            facts_with_taste, confidence)
+
+    # ---- 2. 身体型：饮品系 ----
+    if cr.get("drink", 0) >= THRESHOLD_MAJORITY and 80 <= kcal <= 250:
+        return PersonaVerdict(
+            PERSONA_MAP["oat"],
+            f"{cr['drink']:.0%} 的订单是饮品，平均 {kcal:.0f} kcal，轻盈的一餐",
+            facts_with_taste, confidence)
+    if prof.zero_drink_ratio >= THRESHOLD_MAJORITY and kcal <= 150:
+        return PersonaVerdict(
+            PERSONA_MAP["zero"],
+            f"你有 {prof.zero_drink_ratio:.0%} 的订单选了 0 卡饮品，快乐不必加糖",
+            facts_with_taste, confidence)
+
+    # ---- 3. 食欲型：先按品类，再按热量分层 ----
+    # 卷王 vs 绝代双爽 vs 平板支撑三者热量区间重叠，靠品类区分：
+    #   卷王=汉堡主导（巨无霸等）；绝代双爽=禽类副食（鸡翅/鸡块）；
+    #   平板支撑=汉堡但热量蛋白需在线。
+    burger_r = cr.get("burger", 0)
+    chicken_r = cr.get("chicken", 0)
+
+    if burger_r >= THRESHOLD_SEGMENT and kcal >= 500:
+        return PersonaVerdict(
+            PERSONA_MAP["king"],
+            f"{burger_r:.0%} 是汉堡，平均 {kcal:.0f} kcal，胃口就是实力",
+            facts_with_taste, confidence)
+    if chicken_r >= THRESHOLD_MAJORITY and kcal >= 380 and pro >= 25:
+        return PersonaVerdict(
+            PERSONA_MAP["double"],
+            f"{chicken_r:.0%} 是鸡肉，平均 {kcal:.0f} kcal、蛋白 {pro:.0f}g，一口封神",
+            facts_with_taste, confidence)
+    # 干饭最强音：鸡肉主导但热量中等（鸡排/麦乐鸡类）
+    if chicken_r >= THRESHOLD_MAJORITY and 260 <= kcal < 380:
+        return PersonaVerdict(
+            PERSONA_MAP["biggest"],
+            f"{chicken_r:.0%} 是鸡肉，平均 {kcal:.0f} kcal，要点就点最大份",
+            facts_with_taste, confidence)
+    # 急死汉堡包：汉堡主导、热量中等（下午垫肚子）
+    if burger_r >= THRESHOLD_SEGMENT and 200 <= kcal < 350:
+        return PersonaVerdict(
+            PERSONA_MAP["starving"],
+            f"{burger_r:.0%} 是汉堡，平均 {kcal:.0f} kcal，三点半就饿了",
+            facts_with_taste, confidence)
+
+    # ---- 4. 蛋白与运动场景 ----
+    if pro >= 20 and kcal >= 400:
+        return PersonaVerdict(
+            PERSONA_MAP["plank"],
+            f"你的订单平均 {kcal:.0f} kcal、蛋白 {pro:.0f}g，热量蛋白都在线",
+            facts_with_taste, confidence)
+    if cr.get("roll", 0) >= THRESHOLD_MAJORITY or prof.work_hour_ratio >= THRESHOLD_WORK_HOUR:
+        detail = (f"{cr['roll']:.0%} 的订单是卷类" if cr.get("roll", 0) >= THRESHOLD_MAJORITY
+                  else f"{prof.work_hour_ratio:.0%} 的订单下在工作日 10-17 点")
+        return PersonaVerdict(
+            PERSONA_MAP["slacker"],
+            f"{detail}，上班的一点慰藉",
+            facts_with_taste, confidence)
+
+    # ---- 6. 蛋白底线：最后兜底 ----
+    # 放在最后是必要的：实测中该规则门槛（蛋白>=12 且热量<400）会抢走
+    # 卷王、干饭最强音等食欲型判定，必须作为兜底而非主判据。
+    if pro >= 12:
+        return PersonaVerdict(
+            PERSONA_MAP["protein"],
+            f"你的订单平均蛋白 {pro:.0f}g，别的都能省，蛋白不能",
+            facts_with_taste, confidence)
+
+    return None
+
+
+def _top_category_cn(prof: TasteProfile) -> str:
+    """把品类占比转成中文描述，用于事实展示。"""
+    cn = {"burger": "汉堡", "chicken": "鸡肉", "fish": "鱼", "pie": "派",
+          "kids": "儿童餐", "roll": "卷", "drink": "饮品", "dessert": "甜品"}
+    items = sorted(prof.category_ratio.items(), key=lambda x: -x[1])
+    return " ".join(f"{cn.get(k, k)}{v:.0%}" for k, v in items if v > 0) or "暂无数据"
+
+
 def judge_persona(ctx: MMTIContext) -> PersonaVerdict:
     """MMTI 人格判定主函数。
 
     判定优先级（自上而下，命中即停）：
-      1. 券时段轮转命中
-      2. 积分行为命中
-      3. 券行为命中
-      4. 复购集中命中
-      5. 默认随性真香派
+      0. 深夜强信号（22 点后）
+      1. 券时段轮转
+      2. 口味特征分析（食欲型 / 身体型 / 心情型）
+      3. 积分行为
+      4. 券过期提醒
+      5. 复购集中
+      6. 默认随性真香派
     """
     now = ctx.now
     facts: list[str] = []
@@ -268,7 +501,13 @@ def judge_persona(ctx: MMTIContext) -> PersonaVerdict:
             confidence,
         )
 
-    # ---- 2. 积分行为 ----
+    # ---- 2. 口味特征分析（食欲型 / 身体型 / 心情型）----
+    prof = build_taste_profile(ctx)
+    verdict = _judge_by_taste(ctx, prof, facts, confidence)
+    if verdict is not None:
+        return verdict
+
+    # ---- 3. 积分行为 ----
     if ctx.points and ctx.lottery:
         times = int(ctx.points.available // ctx.lottery.draw_point)
         if times > 0:
@@ -382,18 +621,60 @@ def list_personas() -> str:
 # 五、Demo 数据（采样自 MCP 实测返回）
 # ============================================================================
 
+# 营养库样本：采样自 list-nutrition-foods 实测返回（160 款中选取人格相关条目）
+NUTRITION_SAMPLE: list[NutritionItem] = [
+    NutritionItem("巨无霸", 513, 27, 26, 961),
+    NutritionItem("麦辣鸡腿汉堡", 485, 24, 24, 1208),
+    NutritionItem("板烧鸡腿堡", 391, 23, 17, 1041),
+    NutritionItem("吉士汉堡包", 294, 16, 12, 673),
+    NutritionItem("汉堡包", 248, 13, 8, 492),
+    NutritionItem("那么大鸡排", 385, 24, 21, 996),
+    NutritionItem("绝代双翅", 469, 32, 27, 1167),
+    NutritionItem("麦乐鸡5块", 213, 12, 12, 422),
+    NutritionItem("麦香鸡", 369, 15, 17, 731),
+    NutritionItem("麦香鱼", 325, 16, 13, 556),
+    NutritionItem("儿童鱼排堡", 269, 15, 6, 442),
+    NutritionItem("香芋派", 232, 2, 12, 159),
+    NutritionItem("菠萝派", 221, 2, 11, 147),
+    NutritionItem("麦麦趣鸡球", 266, 17, 13, 789),
+    NutritionItem("酥酥多笋卷", 342, 14, 15, 1044),
+    NutritionItem("图林根香肠早安营养卷", 425, 14, 23, 977),
+    NutritionItem("火腿扒早安营养卷", 444, 16, 24, 1065),
+    NutritionItem("苹板支撑Pro", 476, 25, 18, 1077),
+    NutritionItem("牛气满满", 495, 26, 24, 764),
+    NutritionItem("培根安格斯厚牛堡", 707, 34, 44, 1037),
+    NutritionItem("芝士双层安格斯厚牛堡", 1003, 58, 65, 1373),
+    NutritionItem("双层深海鳕鱼堡", 485, 28, 21, 917),
+    NutritionItem("麦满分（猪柳蛋）", 387, 23, 21, 846),
+    NutritionItem("双层猪柳蛋麦满分", 513, 29, 32, 1210),
+    NutritionItem("无糖可口可乐中杯", 0, 0, 0, 35),
+    NutritionItem("无糖可口可乐大杯", 0, 0, 0, 53),
+    NutritionItem("冰燕麦奶铁中杯", 132, 3, 5, 87),
+    NutritionItem("热燕麦奶铁大杯", 222, 5, 8, 152),
+    NutritionItem("纯牛奶（盒装）", 129, 7, 7, 73),
+    NutritionItem("热牛奶大杯", 240, 13, 11, 137),
+    NutritionItem("冰美式中杯", 13, 1, 0, 0),
+    NutritionItem("热朱古力", 125, 2, 2, 107),
+    NutritionItem("圆筒冰淇淋", 93, 2, 3, 36),
+    NutritionItem("中薯条", 289, 4, 12, 165),
+    NutritionItem("小薯条", 210, 3, 9, 120),
+    NutritionItem("可口可乐中杯", 147, 0, 0, 0),
+]
+
 
 def build_demo_context(now: datetime) -> MMTIContext:
     """构造一份采样自 MCP 实测返回的演示上下文。
 
     数据来源：
-      - 券：query-my-coupons 实测返回（14 张，节选 3 张）
-      - 订单：order-list 实测返回（3 笔）
+      - 券：query-my-coupons 实测返回（14 张，节选）
+      - 订单：order-list 实测返回（3 笔，含套餐子项）
       - 积分：query-my-account 实测返回
       - 抽奖：query-lottery-info 实测返回（单次 24 积分）
+      - 营养：list-nutrition-foods 实测返回（160 款，节选 32 款）
     """
     return MMTIContext(
         now=now,
+        nutrition=NUTRITION_SAMPLE,
         coupons=[
             # 早餐券：实测返回中每个工作日各有一张 ¥9.9 早餐两件套，05:00-10:29
             Coupon("火腿扒堡早餐两件套", 9.9, datetime(2026, 10, 9, 5, 0),
@@ -409,15 +690,23 @@ def build_demo_context(now: datetime) -> MMTIContext:
             Order("1030748720000571936950761192",
                   datetime(2026, 8, 15, 12, 26),
                   "精选超值随心配", "9900013291", 13.9,
-                  "麦当劳深圳国银金融中心餐厅"),
+                  "麦当劳深圳国银金融中心餐厅",
+                  combo_items=[OrderItem("那么大鸡排（椒盐风味）", "521156"),
+                               OrderItem("可乐麦炫酷", "521328")]),
             Order("1030561090000571241233166421",
                   datetime(2026, 7, 15, 17, 47),
                   "精选超值随心配", "9900013291", 13.9,
-                  "麦当劳佛山乐从裕和路金海文化创意中心餐厅"),
+                  "麦当劳佛山乐从裕和路金海文化创意中心餐厅",
+                  combo_items=[OrderItem("高达吉士双牛堡", "521316"),
+                               OrderItem("无糖可口可乐中杯", "3071")]),
             Order("1030877110000570479337860051",
                   datetime(2026, 6, 10, 12, 3),
                   "精选超值随心配", "9900013291", 18.9,
-                  "麦当劳广州英雄广场餐厅(烈士陵园地铁A出口)"),
+                  "麦当劳广州英雄广场餐厅(烈士陵园地铁A出口)",
+                  combo_items=[OrderItem("那么大鸡排（椒盐风味）", "521156"),
+                               OrderItem("小薯条", "4800"),
+                               OrderItem("圆筒冰淇淋", "515837"),
+                               OrderItem("无糖可乐麦炫酷", "521329")]),
         ],
         points=PointAccount(available=56.5, accumulated=927,
                             used=564, expired=306.5),
@@ -426,7 +715,128 @@ def build_demo_context(now: datetime) -> MMTIContext:
 
 
 # ============================================================================
-# 六、CLI
+# 六、判定覆盖率自测
+# ============================================================================
+
+
+def _synth_orders(plan: list[tuple[str, str, int]]) -> list[Order]:
+    """按 (餐品名, 下单时间, 金额) 构造合成订单，仅用于覆盖率自测。
+
+    模拟真实场景的两接口关联：按餐品名到NUTRITION_SAMPLE 查营养条目，
+    并挂到 order.nutrition 上，供 build_taste_profile 统计。
+    这些订单不是真实用户数据，仅验证判定规则是否可触达。
+    """
+    index = {n.name: n for n in NUTRITION_SAMPLE}
+    return [
+        Order(f"SYNTH{i:04d}", datetime.strptime(t, "%Y-%m-%d %H:%M"),
+              name, "SYNTH", amount, f"合成门店{i}",
+              nutrition=index.get(name))
+        for i, (name, t, amount) in enumerate(plan)
+    ]
+
+
+# 覆盖 16 张人格的构造样本：(人格 key, 订单列表, 券列表, 时间)
+COVERAGE_CASES: list[tuple[str, list[tuple[str, str, int]]]] = [
+    # 食欲型
+    ("king", [("巨无霸", "2026-08-01 12:30", 35.0),
+              ("麦辣鸡腿汉堡", "2026-08-03 12:40", 32.0),
+              ("芝士双层安格斯厚牛堡", "2026-08-05 12:30", 45.0),
+              ("双层深海鳕鱼堡", "2026-08-08 12:20", 38.0)]),
+    ("biggest", [("那么大鸡排", "2026-08-01 12:30", 25.0),
+                 ("麦乐鸡5块", "2026-08-03 12:40", 22.0),
+                 ("麦麦脆汁鸡-琵琶腿", "2026-08-05 12:30", 28.0)]),
+    ("double", [("绝代双翅", "2026-08-01 20:10", 30.0),
+                ("绝代双翅", "2026-08-03 20:20", 30.0),
+                ("麦乐鸡5块", "2026-08-05 20:30", 26.0),
+                ("那么大鸡排", "2026-08-08 20:00", 25.0)]),
+    ("starving", [("吉士汉堡包", "2026-08-01 15:30", 15.0),
+                  ("汉堡包", "2026-08-03 16:20", 12.0),
+                  ("麦香鱼", "2026-08-05 15:40", 18.0)]),
+    # 身体型
+    ("plank", [("苹板支撑Pro", "2026-08-01 12:30", 29.9),
+               ("牛气满满", "2026-08-03 12:40", 28.0),
+               ("双层深海鳕鱼堡", "2026-08-05 12:30", 32.0)]),
+    ("oat", [("冰燕麦奶铁中杯", "2026-08-01 15:30", 14.0),
+             ("热燕麦奶铁大杯", "2026-08-03 15:40", 17.0),
+             ("冰燕麦奶铁中杯", "2026-08-05 15:30", 14.0)]),
+    ("zero", [("无糖可口可乐大杯", "2026-08-01 12:30", 9.0),
+              ("无糖可口可乐中杯", "2026-08-03 12:40", 8.0),
+              ("无糖可口可乐大杯", "2026-08-05 12:30", 9.0),
+              ("冰美式中杯", "2026-08-07 15:00", 10.0)]),
+    ("protein", [("纯牛奶（盒装）", "2026-08-01 08:20", 9.0),
+                 ("热牛奶大杯", "2026-08-03 08:30", 12.0),
+                 ("麦满分（猪柳蛋）", "2026-08-05 08:10", 22.0)]),
+    # 心情型
+    ("kid", [("儿童鱼排堡", "2026-08-01 12:30", 18.0),
+             ("儿童鱼排堡", "2026-08-03 12:40", 18.0),
+             ("儿童鱼排堡", "2026-08-05 12:30", 18.0),
+             ("麦香鱼", "2026-08-07 18:00", 22.0)]),
+    ("pie", [("香芋派", "2026-08-01 15:30", 8.0),
+             ("菠萝派", "2026-08-03 15:40", 8.0),
+             ("香芋派", "2026-08-05 15:30", 8.0),
+             ("圆筒冰淇淋", "2026-08-07 20:00", 8.0)]),
+    ("slacker", [("酥酥多笋卷", "2026-08-03 10:30", 12.0),
+                  ("图林根香肠早安营养卷", "2026-08-04 11:20", 15.0),
+                  ("火腿扒早安营养卷", "2026-08-05 14:30", 16.0),
+                  ("麦麦趣鸡球", "2026-08-06 16:00", 14.0)]),
+]
+
+# 券与时段驱动的 5 张
+COVERAGE_TIMED: list[tuple[str, datetime, list[Coupon]]] = [
+    ("perfect", datetime(2026, 10, 9, 7, 30), [
+        Coupon("火腿扒堡早餐两件套", 9.9, datetime(2026, 10, 9, 5, 0),
+               datetime(2026, 10, 9, 10, 29), (4,), 5, 11)]),
+    ("coupon", datetime(2026, 10, 9, 21, 5), [
+        Coupon("麦旋风任选", 9.9, datetime(2026, 10, 5, 10, 30),
+               datetime(2026, 10, 9, 23, 59), (0, 1, 2, 3, 4), 10, 24)]),
+    ("midnight", datetime(2026, 10, 9, 22, 30), []),
+    ("points", datetime(2026, 10, 9, 15, 0), []),
+    ("random", datetime(2026, 10, 9, 15, 0), []),
+]
+
+
+def run_coverage_test() -> None:
+    """验证 16 张人格是否全部可被判定规则触达。"""
+    print("=" * 52)
+    print("MMTI 人格判定覆盖率自测")
+    print("=" * 52)
+
+    results: dict[str, str] = {}
+
+    # 券 / 时段 / 积分 / 默认 驱动的 5 张
+    for key, now, coupons in COVERAGE_TIMED:
+        pts = PointAccount(56.5, 927, 564, 306.5) if key == "points" else None
+        lot = Lottery(24, "板烧三件套5折券") if key == "points" else None
+        ctx = MMTIContext(now=now, coupons=coupons, points=pts, lottery=lot)
+        results[key] = judge_persona(ctx).persona.key
+
+    # 口味特征驱动的 11 张
+    for key, plan in COVERAGE_CASES:
+        ctx = MMTIContext(now=datetime(2026, 10, 9, 14, 0),
+                          orders=_synth_orders(plan), nutrition=NUTRITION_SAMPLE)
+        results[key] = judge_persona(ctx).persona.key
+
+    # 汇总
+    ok = 0
+    print(f"\n{'人格 key':<12}{'预期':<12}{'实际':<12}{'结果'}")
+    print("-" * 52)
+    for key in [k for k, _, _ in COVERAGE_TIMED] + [k for k, _ in COVERAGE_CASES]:
+        actual = results.get(key, "-")
+        good = actual == key
+        ok += good
+        print(f"{key:<12}{key:<12}{actual:<12}{'PASS' if good else 'FAIL'}")
+    print("-" * 52)
+    print(f"\n覆盖率：{ok}/16")
+    if ok == 16:
+        print("全部人格均可被判定规则触达。")
+    else:
+        failed = [k for k in results if results[k] != k]
+        print(f"未触达或错判：{', '.join(failed)}")
+    print("\n说明：合成订单仅用于规则自测，不含真实用户数据。\n")
+
+
+# ============================================================================
+# 七、CLI
 # ============================================================================
 
 
@@ -438,10 +848,16 @@ def main() -> None:
     parser.add_argument("--now", help="模拟时间，格式 YYYY-MM-DDTHH:MM，默认当前时间")
     parser.add_argument("--list", action="store_true", help="列出全部 16 型人格")
     parser.add_argument("--timeline", action="store_true", help="输出今日人格轨迹")
+    parser.add_argument("--coverage", action="store_true",
+                        help="自测：验证 16 张人格是否均可被判定触达")
     args = parser.parse_args()
 
     if args.list:
         print(list_personas())
+        return
+
+    if args.coverage:
+        run_coverage_test()
         return
 
     now = (datetime.fromisoformat(args.now) if args.now else datetime.now())
