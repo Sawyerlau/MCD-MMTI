@@ -54,7 +54,7 @@ MMTI 的人格不是贴在用户身上的静态标签，而是由**真实的券�
 
 ## 使用的 MCP Tool
 
-共9 个：
+共 13 个：
 
 - **判定采集**：`now-time-info`、`query-my-coupons`、`available-coupons`、`order-list`、`query-my-account`
 - **推荐计价**：`list-nutrition-foods`、`query-meals`、`calculate-price`、`query-nearby-stores`

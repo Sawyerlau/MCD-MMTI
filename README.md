@@ -83,7 +83,13 @@ MMTI 的人格不是贴在用户身上的静态标签，而是由**真实的券�
 
 ## 安装
 
-### 1. 配置 MCP Server
+### 1. 克隆仓库
+
+```bash
+git clone git@github.com:Sawyerlau/MCD-MMTI.git
+```
+
+### 2. 配置 MCP Server
 
 在 `~/.workbuddy/mcp.json` 中加入：
 
@@ -103,9 +109,78 @@ MMTI 的人格不是贴在用户身上的静态标签，而是由**真实的券�
 
 配置后需在连接器管理页面右上角的「自定义连接器」入口对新服务点击「信任」才会加载。
 
-### 2. 安装 Skill
+> Token 请通过环境变量传入。仓库中仅提供占位符，不包含任何真实凭证。
 
-将 `SKILL.md` 放入技能目录，或直接在 WorkBuddy 中引用该文件。
+### 3. 安装 Skill
+
+Skill 采用「一个目录 + 一个 SKILL.md」的标准结构。把三个核心文件放进技能目录：
+
+```bash
+# Windows（Git Bash）
+mkdir -p ~/.workbuddy/skills/mcd-mmti
+cp MCD-MMTI/SKILL.md MCD-MMTI/SOUL.md MCD-MMTI/main.py ~/.workbuddy/skills/mcd-mmti/
+```
+
+安装后的目录结构：
+
+```
+~/.workbuddy/skills/mcd-mmti/
+├── SKILL.md     ← 必需。Skill 主文件，含 frontmatter 与判定规则
+├── SOUL.md      ← 可选。对话人格设定
+└── main.py      ← 可选。命令行可运行实现
+```
+
+`SKILL.md` 顶部的 frontmatter 声明了触发词，无需额外配置：
+
+```yaml
+---
+name: mcd-mmti
+description: 读取用户的麦当劳真实订单、优惠券时间轴、积分账本与活动日历，
+             判定用户此刻的麦当劳人格……当用户提到麦当劳、麦麦、点餐、
+             优惠券、积分、今天吃什么、麦麦人格、人格卡时使用。
+---
+```
+
+## 调用方式
+
+### 方式一：对话触发（推荐）
+
+直接提问，Skill 会自动匹配并调用 MCP：
+
+```
+我是哪个人格？
+今天吃什么？
+我的券什么时候用最划算
+我是卷王
+```
+
+以下说法同样会触发：麦当劳、麦麦、MMTI、点餐、优惠券、积分、今天吃什么、人格卡。
+
+### 方式二：显式指定
+
+```
+用 mcd-mmti skill 帮我算人格
+```
+
+### 方式三：命令行运行
+
+```bash
+# 输出当前时刻的人格卡
+python main.py
+
+# 指定时刻，观察人格轮转
+python main.py --now 2026-10-09T07:30 --timeline
+
+# 列出全部 16 型人格
+python main.py --list
+
+# 自测：验证 16 张人格是否均可被判定触达
+python main.py --coverage
+```
+
+无第三方依赖，Python 3.10+ 直接运行。
+
+> `main.py` 面向离线演示，内置数据为采样自 MCP 实测返回的样本。真实使用时请通过对话触发，由 Skill 调用实时MCP 数据。
 
 ## 使用示例
 

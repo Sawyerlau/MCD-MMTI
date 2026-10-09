@@ -31,7 +31,7 @@ WorkBuddy 用户可在 `~/.workbuddy/mcp.json` 中配置：
 
 ## 实际使用的 Tool
 
-MCD-MMTI 共调用 9 个 Tool，分为三组。
+MCD-MMTI 共调用 13 个 Tool，分为三组。
 
 ### 第一组：人格判定的数据采集
 
