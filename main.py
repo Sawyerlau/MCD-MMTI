@@ -235,6 +235,7 @@ class PersonaVerdict:
     reason: str  # 归因话术，必须包含真实数据
     facts: list[str] = field(default_factory=list)  # 分享卡第二段
     confidence: str = "中"  # 高/中/低
+    data_gaps: list[str] = field(default_factory=list)  # 无法关联营养库的数据缺口
 
     @property
     def family_tagline(self) -> str:
@@ -291,22 +292,33 @@ class TasteProfile:
     zero_drink_ratio: float = 0.0  # 点了0/极低卡饮品的订单占比
     work_hour_ratio: float = 0.0  # 工作日 10-17 点下单占比
     matched_orders: int = 0  # 成功关联营养数据的订单数
+    # 数据缺口：营养库中确实不存在的条目名（直说，不掩盖）
+    missing_items: list[str] = field(default_factory=list)
+    # 估算标记：名称匹配但规格未标注，热量为估算值
+    estimated_items: list[str] = field(default_factory=list)
 
 
 def _norm(name: str) -> str:
     """餐品名归一化，用于营养库与品类模糊匹配。
 
-    MCP 返回的餐品名带大量营销修饰与规格后缀，而营养库用的是标准品名。
-    例：「那么大鸡排（椒盐风味）」→「那么大鸡排」
-        「可乐麦炫酷」→ 去营销词后按子串命中「可口可乐」
+    MCP 返回的餐品名与营养库品名存在三类差异，必须归一化后才能匹配：
 
-    注意：杯型（大杯/中杯/小杯）必须保留，否则 0 卡与大杯会被混为一谈。
+    1. **括号内容**：「那么大鸡排（椒盐风味）」→「那么大鸡排」
+    2. **营销后缀**：「可乐麦炫酷」需按子串命中「可乐」
+    3. **装饰引号**（实测踩坑）：营养库中「“苹板”支撑Pro」带中文引号，
+       而订单侧为「苹板支撑Pro」，不去引号会漏匹配
+
+    注意：杯型（大杯/中杯/小杯）必须保留，否则 0卡与大杯会被混为一谈。
     """
     s = name.strip()
-    # 去括号内容（椒盐风味、限量装等）
-    for l, r in (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]")):
+    # 统一各类括号
+    for l, r in (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"), ("〔", "〕")):
         if l in s and r in s:
             s = s[:s.index(l)] + s[s.index(r) + 1:]
+    # 去除装饰性引号（中英文单双引号、书名号）
+    for noise in ('"', "'", "“", "”", "‘", "’", "「", "」",
+                  "《", "》", "『", "』"):
+        s = s.replace(noise, "")
     # 去营销后缀词，但保留规格
     for noise in ("麦炫酷", "会员专享", "经典款", "升级款", "超值"):
         s = s.replace(noise, "")
@@ -314,19 +326,37 @@ def _norm(name: str) -> str:
 
 
 def _match_nutrition(name: str, index: dict[str, NutritionItem]) -> Optional[NutritionItem]:
-    """在营养库中匹配餐品，依次尝试精确、归一化精确、子串包含三级策略。
+    """在营养库中匹配餐品，采用四级策略。
 
-    匹配优先级必须保证杯型优先：
-    「无糖可口可乐中杯」应命中中杯（0 kcal），而非被「无糖可口可乐大杯」抢占。
+    1. 精确匹配
+    2. 归一化后精确匹配（处理括号、引号、营销词）
+    3. 规格标注齐全时的子串匹配
+    4. 其余情况判定为「匹配不到」
+
+    ⚠️ 为什么宁可匹配不到，也不硬凑（实测踩坑）：
+    订单「可乐麦炫酷」归一化后为「可乐」，营养库有「可乐中杯/大杯/小杯」
+    三种规格。若按子串硬匹配会落到某一种（107/147/224 kcal），
+    而实际是哪一种无法确定——热量可能凭空多出或少掉 100 余 kcal。
+    这种情况应如实标记为缺口，而不是给出一个看似精确的错值。
+
+    例外：订单明确标注杯型时（「无糖可口可乐中杯」），可安全按规格匹配。
     """
     if name in index:
         return index[name]
     n = _norm(name)
     if n in index:
         return index[n]
-    # 子串包含：取最长命中，避免短词抢占长词
+
+    # 双向子串：库名较长时用库名去订单名里找（如「可达」→「可达龙牙菜」）
     hits = [k for k in index if k and k in n]
-    return index[max(hits, key=len)] if hits else None
+    if not hits:
+        return None
+
+    # 规格校验：订单名未标注杯型/尺寸时，不做猜测
+    has_size = any(k in n for k in ("大杯", "中杯", "小杯", "迷你", "超值", "任选"))
+    if not has_size:
+        return None
+    return index[max(hits, key=len)]
 
 
 def _category_of(name: str) -> Optional[str]:
@@ -354,19 +384,27 @@ def build_taste_profile(ctx: MMTIContext) -> TasteProfile:
         return prof
 
     index = {n.name: n for n in ctx.nutrition}
+    # 索引也做一次归一化，覆盖「“苹板”支撑Pro」这类带引号的品名
+    norm_index = {_norm(k): v for k, v in index.items()}
     matched: list[tuple[Order, NutritionItem]] = []
     cat_hits: dict[str, int] = {k: 0 for k in CATEGORY_KEYWORDS}
+    missing: list[str] = []
+    estimated: list[str] = []
 
     for o in ctx.orders:
         names = o.all_item_names
 
         # ---- 营养关联：主品优先，否则按子项累加 ----
-        main_hit = index.get(o.product_name) or _match_nutrition(o.product_name, index)
+        main_hit = (index.get(o.product_name)
+                    or _match_nutrition(o.product_name, norm_index))
         if main_hit is not None:
             o.nutrition = main_hit
+            if "估算" in main_hit.name:
+                estimated.append(f"{o.product_name} → {main_hit.name}")
         else:
             # 套餐：累加所有能匹配上的子项
-            parts = [p for p in (_match_nutrition(i.name, index) for i in o.combo_items)
+            parts = [(i.name, p) for i, p in
+                     ((i, _match_nutrition(i.name, norm_index)) for i in o.combo_items)
                      if p is not None]
             total_subs = len(o.combo_items)
             # 关键：子项匹配不全时不能当作完整热量用。
@@ -377,22 +415,31 @@ def build_taste_profile(ctx: MMTIContext) -> TasteProfile:
             if parts and coverage >= 0.6:
                 o.nutrition = NutritionItem(
                     name=f"{o.product_name}（子项累加，{len(parts)}/{total_subs} 项）",
-                    kcal=sum(p.kcal for p in parts),
-                    protein=round(sum(p.protein for p in parts), 1),
-                    fat=round(sum(p.fat for p in parts), 1),
-                    sodium=sum(p.sodium for p in parts),
+                    kcal=sum(p.kcal for _, p in parts),
+                    protein=round(sum(p.protein for _, p in parts), 1),
+                    fat=round(sum(p.fat for _, p in parts), 1),
+                    sodium=sum(p.sodium for _, p in parts),
                 )
+                estimated.extend(
+                    f"{nm} → {p.name}" for nm, p in parts if "估算" in p.name)
             elif parts:
                 # 覆盖不足：仅作品类参考，不参与热量统计
                 o.partial_nutrition = NutritionItem(
                     name=f"{o.product_name}（部分匹配 {len(parts)}/{total_subs}）",
-                    kcal=sum(p.kcal for p in parts),
-                    protein=round(sum(p.protein for p in parts), 1),
-                    fat=round(sum(p.fat for p in parts), 1),
-                    sodium=sum(p.sodium for p in parts),
+                    kcal=sum(p.kcal for _, p in parts),
+                    protein=round(sum(p.protein for _, p in parts), 1),
+                    fat=round(sum(p.fat for _, p in parts), 1),
+                    sodium=sum(p.sodium for _, p in parts),
                 )
         if o.nutrition is not None:
             matched.append((o, o.nutrition))
+        else:
+            # 记录完全匹配不到的子项，供输出时如实告知用户。
+            # 套餐主品（如「精选超值随心配」）是容器不是餐品，
+            # 它不在营养库是正常的，不应作为缺口告知用户。
+            for it in o.combo_items:
+                if _match_nutrition(it.name, norm_index) is None:
+                    missing.append(it.name)
 
         # ---- 品类统计：逐个餐品判定，一单可命中多品类 ----
         for nm in names:
@@ -403,6 +450,8 @@ def build_taste_profile(ctx: MMTIContext) -> TasteProfile:
     n = len(ctx.orders)
     prof.category_ratio = {k: v / n for k, v in cat_hits.items()}
     prof.matched_orders = len(matched)
+    prof.missing_items = sorted(set(missing))
+    prof.estimated_items = sorted(set(estimated))
 
     if matched:
         prof.avg_kcal = sum(m.kcal for _, m in matched) / len(matched)
@@ -531,19 +580,37 @@ def _top_category_cn(prof: TasteProfile) -> str:
 
 
 def judge_persona(ctx: MMTIContext) -> PersonaVerdict:
-    """MMTI 人格判定主函数。
+    """MMTI 人格判定入口。
 
-    判定优先级（自上而下，命中即停）：
+    统一在此处注入数据缺口——判定本身可能从多个分支返回，
+    若在各分支内注入会遗漏（实测踩坑：走「复购集中」分支时缺口未显示）。
+    """
+    return _judge(ctx)
+
+
+def _judge(ctx: MMTIContext) -> PersonaVerdict:
+    """人格判定主逻辑，判定优先级：
+
       0. 深夜强信号（22 点后）
       1. 券时段轮转
       2. 口味特征分析（食欲型 / 身体型 / 心情型）
       3. 积分行为
       4. 券过期提醒
       5. 复购集中
-      6. 默认随性真香派
+      6. 冷启动引导自选
     """
     now = ctx.now
     facts: list[str] = []
+    prof = build_taste_profile(ctx)
+
+    verdict = _judge_core(ctx, prof, facts)
+    verdict.data_gaps = list(prof.missing_items)
+    return verdict
+
+
+def _judge_core(ctx: MMTIContext, prof: "TasteProfile", facts: list[str]) -> PersonaVerdict:
+    """核心判定逻辑。数据缺口由外层 _judge 统一注入。"""
+    now = ctx.now
 
     # ---- 收集第二段事实数据（全部来自 MCP 真实返回）----
     if ctx.orders:
@@ -588,7 +655,6 @@ def judge_persona(ctx: MMTIContext) -> PersonaVerdict:
         )
 
     # ---- 2. 口味特征分析（食欲型 / 身体型 / 心情型）----
-    prof = build_taste_profile(ctx)
     verdict = _judge_by_taste(ctx, prof, facts, confidence)
     if verdict is not None:
         return verdict
@@ -725,8 +791,13 @@ def render_card(v: PersonaVerdict) -> str:
         sep,
         _row(_trunc(p.tagline, w - PAD), w),
         _row("可切换或自选 16 张人格", w),
-        foot,
     ]
+    if v.data_gaps:
+        lines.append(sep)
+        lines.append(_row(f"⚠ {len(v.data_gaps)} 项餐品营养数据缺失", w))
+        for g in v.data_gaps[:3]:
+            lines.append(_row(_trunc(f"· {g}", w - PAD), w))
+    lines.append(foot)
     return "\n".join(lines)
 
 
