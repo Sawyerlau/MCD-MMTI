@@ -160,6 +160,8 @@ class Order:
     store_name: str
     combo_items: list[OrderItem] = field(default_factory=list)
     nutrition: Optional["NutritionItem"] = None
+    # 子项部分匹配时的结果，仅作品类参考，不参与热量统计（见 build_taste_profile）
+    partial_nutrition: Optional["NutritionItem"] = None
 
     @property
     def all_item_names(self) -> list[str]:
@@ -291,31 +293,112 @@ class TasteProfile:
     matched_orders: int = 0  # 成功关联营养数据的订单数
 
 
+def _norm(name: str) -> str:
+    """餐品名归一化，用于营养库与品类模糊匹配。
+
+    MCP 返回的餐品名带大量营销修饰与规格后缀，而营养库用的是标准品名。
+    例：「那么大鸡排（椒盐风味）」→「那么大鸡排」
+        「可乐麦炫酷」→ 去营销词后按子串命中「可口可乐」
+
+    注意：杯型（大杯/中杯/小杯）必须保留，否则 0 卡与大杯会被混为一谈。
+    """
+    s = name.strip()
+    # 去括号内容（椒盐风味、限量装等）
+    for l, r in (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]")):
+        if l in s and r in s:
+            s = s[:s.index(l)] + s[s.index(r) + 1:]
+    # 去营销后缀词，但保留规格
+    for noise in ("麦炫酷", "会员专享", "经典款", "升级款", "超值"):
+        s = s.replace(noise, "")
+    return s.strip()
+
+
+def _match_nutrition(name: str, index: dict[str, NutritionItem]) -> Optional[NutritionItem]:
+    """在营养库中匹配餐品，依次尝试精确、归一化精确、子串包含三级策略。
+
+    匹配优先级必须保证杯型优先：
+    「无糖可口可乐中杯」应命中中杯（0 kcal），而非被「无糖可口可乐大杯」抢占。
+    """
+    if name in index:
+        return index[name]
+    n = _norm(name)
+    if n in index:
+        return index[n]
+    # 子串包含：取最长命中，避免短词抢占长词
+    hits = [k for k in index if k and k in n]
+    return index[max(hits, key=len)] if hits else None
+
+
+def _category_of(name: str) -> Optional[str]:
+    """判定单个餐品所属品类。返回 None 表示不属于任何已定义品类。
+
+    品类关键词必须按特异性排序——「儿童鱼排堡」要先于「鱼排」命中，
+    否则儿童餐会被误判为鱼类（实测踩坑）。
+    """
+    n = _norm(name)
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        if any(k in n for k in kws):
+            return cat
+    return None
+
+
 def build_taste_profile(ctx: MMTIContext) -> TasteProfile:
-    """构建口味特征。所有比例均基于真实订单计算，不做推断。"""
+    """构建口味特征。所有比例均基于真实订单计算，不做推断。
+
+    关键处理：套餐类订单（主品为「超值随心配」这类套餐名）在营养库中
+    没有对应条目，必须按子项**累加**营养值，不能取第一个匹配项。
+    （实测踩坑：曾把 147 kcal 的饮料当成整单热量，导致人格误判为「燕麦轻盈派」）
+    """
     prof = TasteProfile(total_orders=len(ctx.orders))
     if not ctx.orders:
         return prof
 
-    # 关联营养库
     index = {n.name: n for n in ctx.nutrition}
     matched: list[tuple[Order, NutritionItem]] = []
     cat_hits: dict[str, int] = {k: 0 for k in CATEGORY_KEYWORDS}
 
     for o in ctx.orders:
         names = o.all_item_names
-        hit_nutrition = None
+
+        # ---- 营养关联：主品优先，否则按子项累加 ----
+        main_hit = index.get(o.product_name) or _match_nutrition(o.product_name, index)
+        if main_hit is not None:
+            o.nutrition = main_hit
+        else:
+            # 套餐：累加所有能匹配上的子项
+            parts = [p for p in (_match_nutrition(i.name, index) for i in o.combo_items)
+                     if p is not None]
+            total_subs = len(o.combo_items)
+            # 关键：子项匹配不全时不能当作完整热量用。
+            # 例：子项「高达吉士双牛堡」不在营养库，只匹配到 0 卡可乐，
+            # 若直接取用会把一单算成 0 kcal（实测踩坑）。
+            # 规则：覆盖率不足 60% 时视为匹配失败，交由上层按缺失处理。
+            coverage = len(parts) / total_subs if total_subs else 0.0
+            if parts and coverage >= 0.6:
+                o.nutrition = NutritionItem(
+                    name=f"{o.product_name}（子项累加，{len(parts)}/{total_subs} 项）",
+                    kcal=sum(p.kcal for p in parts),
+                    protein=round(sum(p.protein for p in parts), 1),
+                    fat=round(sum(p.fat for p in parts), 1),
+                    sodium=sum(p.sodium for p in parts),
+                )
+            elif parts:
+                # 覆盖不足：仅作品类参考，不参与热量统计
+                o.partial_nutrition = NutritionItem(
+                    name=f"{o.product_name}（部分匹配 {len(parts)}/{total_subs}）",
+                    kcal=sum(p.kcal for p in parts),
+                    protein=round(sum(p.protein for p in parts), 1),
+                    fat=round(sum(p.fat for p in parts), 1),
+                    sodium=sum(p.sodium for p in parts),
+                )
+        if o.nutrition is not None:
+            matched.append((o, o.nutrition))
+
+        # ---- 品类统计：逐个餐品判定，一单可命中多品类 ----
         for nm in names:
-            if nm in index:
-                hit_nutrition = index[nm]
-                break
-        if hit_nutrition is not None:
-            matched.append((o, hit_nutrition))
-        for nm in names:
-            for cat, kws in CATEGORY_KEYWORDS.items():
-                if any(k in nm for k in kws):
-                    cat_hits[cat] += 1
-                    break
+            cat = _category_of(nm)
+            if cat:
+                cat_hits[cat] += 1
 
     n = len(ctx.orders)
     prof.category_ratio = {k: v / n for k, v in cat_hits.items()}
@@ -338,7 +421,10 @@ def _judge_by_taste(ctx: MMTIContext, prof: TasteProfile,
 
     返回 None 表示未命中，交由上层继续判定。
     """
-    if prof.total_orders < 2:
+    # 冷启动保护：订单少于 2 笔时口味特征不可靠（实测踩坑：
+    # 真实用户可能只有 0-1 笔订单，此时 16 张人格中有 12 张无法判定）。
+    # 宁可不判，也不要用2 笔数据编造结论。
+    if prof.total_orders < 2 or prof.matched_orders < 2:
         return None
 
     cr = prof.category_ratio
@@ -543,11 +629,13 @@ def judge_persona(ctx: MMTIContext) -> PersonaVerdict:
             confidence,
         )
 
-    # ---- 5. 默认 ----
+    # ---- 5. 冷启动：无数据或数据不足，明确告知并引导自选 ----
+    # 不编造结论——口味人格需2 笔以上订单才可靠（实测踩坑）。
     return PersonaVerdict(
         PERSONA_MAP["random"],
-        "还没有订单数据，先给你一个随性人格",
-        facts,
+        "还没有足够的订单数据，口味人格需要 2 笔以上订单才能判定。"
+        "你可以直接从 16 张人格里选一张，我按那张推荐。",
+        facts or ["暂无订单数据"],
         "低",
     )
 
@@ -659,6 +747,15 @@ NUTRITION_SAMPLE: list[NutritionItem] = [
     NutritionItem("中薯条", 289, 4, 12, 165),
     NutritionItem("小薯条", 210, 3, 9, 120),
     NutritionItem("可口可乐中杯", 147, 0, 0, 0),
+    # 套餐子项常见品（补全以提升子项匹配覆盖率）
+    NutritionItem("高达吉士双牛堡", 476, 25, 18, 1077),
+    NutritionItem("吉士双牛堡", 466, 24, 18, 1005),
+    NutritionItem("可乐麦炫酷", 105, 0, 0, 0),
+    NutritionItem("无糖可乐麦炫酷", 0, 0, 0, 0),
+    NutritionItem("雪碧麦炫酷", 96, 0, 0, 0),
+    NutritionItem("麦趣鸡球", 266, 17, 13, 789),
+    NutritionItem("鸡腿堡（经典）", 391, 23, 17, 1041),
+    NutritionItem("上校鸡块", 232, 14, 15, 470),
 ]
 
 
